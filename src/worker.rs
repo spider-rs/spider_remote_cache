@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, OnceCell};
 use tokio::task::JoinSet;
 
@@ -6,6 +13,10 @@ use crate::client;
 use crate::types::HttpVersion;
 
 static REMOTE_DUMP_TX: OnceCell<mpsc::Sender<DumpJob>> = OnceCell::const_new();
+
+/// Approximate number of bytes currently sitting in the queue + batch drain.
+/// Incremented on enqueue, decremented when the worker consumes a job.
+static QUEUE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// A job representing a single cached response to upload to the remote cache.
 #[derive(Debug)]
@@ -25,8 +36,21 @@ pub struct DumpJob {
     pub dump_remote: Option<String>,
 }
 
+impl DumpJob {
+    /// Rough estimate of the memory this job occupies (body dominates).
+    #[inline]
+    pub fn estimated_bytes(&self) -> usize {
+        self.body.len()
+            + self.cache_key.len()
+            + self.cache_site.len()
+            + self.url.len()
+            + self.method.len()
+            + 256 // headers overhead estimate
+    }
+}
+
 /// Maximum number of items to send in a single batch POST.
-const MAX_BATCH_SIZE: usize = 64;
+const MAX_BATCH_SIZE: usize = 16;
 
 async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender<DumpJob> {
     let (tx, mut rx) = mpsc::channel::<DumpJob>(queue_cap.max(1));
@@ -43,6 +67,10 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
 
         let timeout = Duration::from_millis(timeout_ms);
 
+        // Cap how many jobs we drain in a single batch to bound the Vec
+        // allocation and prevent one burst from monopolising memory.
+        let max_drain: usize = (queue_cap / 4).clamp(64, 1024);
+
         loop {
             reap_completed(&mut join_set, &inflight);
 
@@ -51,12 +79,25 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
                 None => break,
             };
 
-            // Batch-drain all pending jobs.
-            let mut batch = Vec::with_capacity(64);
+            // Track bytes released from the queue as we drain.
+            let mut drained_bytes = first_job.estimated_bytes();
+
+            // Batch-drain pending jobs, but cap the drain to avoid
+            // building an enormous Vec when the channel is backed up.
+            let mut batch = Vec::with_capacity(max_drain.min(64));
             batch.push(first_job);
-            while let Ok(job) = rx.try_recv() {
-                batch.push(job);
+            while batch.len() < max_drain {
+                match rx.try_recv() {
+                    Ok(job) => {
+                        drained_bytes += job.estimated_bytes();
+                        batch.push(job);
+                    }
+                    Err(_) => break,
+                }
             }
+
+            // Release the tracked queue bytes now that we own the jobs.
+            QUEUE_BYTES.fetch_sub(drained_bytes, Ordering::Relaxed);
 
             // Dedup against in-flight keys and group by endpoint.
             let mut groups: HashMap<String, Vec<DumpJob>> = HashMap::new();
@@ -117,7 +158,8 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
             reap_completed(&mut join_set, &inflight);
         }
 
-        // Graceful shutdown.
+        // Graceful shutdown — drain remaining queue bytes.
+        QUEUE_BYTES.store(0, Ordering::Relaxed);
         while let Some(result) = join_set.join_next().await {
             if let Ok(keys) = result {
                 for key in keys {
@@ -214,18 +256,63 @@ pub async fn init_remote_dump_worker(
         .clone()
 }
 
+/// Returns `true` if the job is within the configured body size limit.
+/// Oversized jobs are silently dropped to protect memory and CPU.
+#[inline]
+fn within_limits(job: &DumpJob) -> bool {
+    let max = default_max_body_size();
+    if max > 0 && job.body.len() > max {
+        tracing::debug!(
+            "remote dump skipped: body {} bytes exceeds max {} for {}",
+            job.body.len(),
+            max,
+            job.cache_key,
+        );
+        return false;
+    }
+    let budget = default_queue_memory_budget();
+    if budget > 0 && QUEUE_BYTES.load(Ordering::Relaxed) > budget {
+        tracing::debug!(
+            "remote dump skipped: queue memory budget {}B exceeded",
+            budget,
+        );
+        return false;
+    }
+    true
+}
+
 /// Auto-init on first use + best-effort enqueue (never blocks on full queue).
 pub async fn enqueue_best_effort(job: DumpJob) -> bool {
+    if !within_limits(&job) {
+        return false;
+    }
     let tx =
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
-    tx.try_send(job).is_ok()
+    let est = job.estimated_bytes();
+    match tx.try_send(job) {
+        Ok(()) => {
+            QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Enqueue with backpressure (blocks if queue is full).
 pub async fn enqueue(job: DumpJob) -> Result<(), mpsc::error::SendError<DumpJob>> {
+    if !within_limits(&job) {
+        return Ok(()); // silently drop oversized/over-budget jobs
+    }
     let tx =
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
-    tx.send(job).await
+    let est = job.estimated_bytes();
+    match tx.send(job).await {
+        Ok(()) => {
+            QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Returns true if the worker has been initialized.
@@ -235,10 +322,23 @@ pub fn worker_inited() -> bool {
 
 /// Non-async enqueue (fast path). Drops if queue is full or worker not initialized.
 pub fn try_enqueue(job: DumpJob) -> bool {
-    REMOTE_DUMP_TX
+    if !within_limits(&job) {
+        return false;
+    }
+    let est = job.estimated_bytes();
+    let ok = REMOTE_DUMP_TX
         .get()
         .and_then(|tx| tx.try_send(job).ok())
-        .is_some()
+        .is_some();
+    if ok {
+        QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Returns the approximate number of bytes currently queued for upload.
+pub fn queue_bytes() -> usize {
+    QUEUE_BYTES.load(Ordering::Relaxed)
 }
 
 /// Init the worker with default settings.
@@ -254,7 +354,7 @@ pub fn default_queue_cap() -> usize {
     std::env::var("HYBRID_CACHE_REMOTE_QUEUE_CAP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000)
+        .unwrap_or(2_000)
 }
 
 pub fn default_qps() -> u32 {
@@ -275,5 +375,27 @@ pub fn default_max_concurrent() -> usize {
     std::env::var("HYBRID_CACHE_REMOTE_MAX_CONCURRENT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
+        .unwrap_or(8)
+}
+
+/// Maximum body size (in bytes) for a single dump job.
+/// Bodies larger than this are silently dropped.
+/// Set to 0 to disable the limit.
+/// Default: 5 MiB.
+pub fn default_max_body_size() -> usize {
+    std::env::var("HYBRID_CACHE_REMOTE_MAX_BODY_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5 * 1024 * 1024)
+}
+
+/// Approximate memory budget (in bytes) for the dump queue.
+/// When the queue exceeds this, new jobs are dropped until it drains.
+/// Set to 0 to disable the budget.
+/// Default: 256 MiB.
+pub fn default_queue_memory_budget() -> usize {
+    std::env::var("HYBRID_CACHE_REMOTE_MEMORY_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 * 1024 * 1024)
 }

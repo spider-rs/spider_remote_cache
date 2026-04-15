@@ -13,7 +13,7 @@
 //! # Features
 //!
 //! - **Batch-drain**: Collects pending jobs from the channel before uploading
-//! - **Concurrent uploads**: Configurable parallelism via semaphore (default 32)
+//! - **Concurrent uploads**: Configurable parallelism via semaphore (default 8)
 //! - **Lock-free dedup**: DashSet for in-flight key tracking (no Mutex, no deadlocks)
 //! - **Rate limiting**: Per-spawn pacing without blocking the drain loop
 //! - **Batch POST**: Uses `/cache/index/batch` when multiple jobs are ready
@@ -30,7 +30,7 @@ pub use client::{
 };
 pub use types::{HttpVersion, HybridCachePayload};
 pub use worker::{
-    default_max_concurrent, default_queue_cap, default_qps, default_timeout_ms, enqueue,
-    enqueue_best_effort, init_default_worker, init_remote_dump_worker, try_enqueue,
-    worker_inited, DumpJob,
+    default_max_body_size, default_max_concurrent, default_queue_cap, default_queue_memory_budget,
+    default_qps, default_timeout_ms, enqueue, enqueue_best_effort, init_default_worker,
+    init_remote_dump_worker, queue_bytes, try_enqueue, worker_inited, DumpJob,
 };

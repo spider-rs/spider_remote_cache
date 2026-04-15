@@ -1,6 +1,6 @@
 [package]
 name = "spider_remote_cache"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["j-mendez <jeff@spider.cloud>"]
 repository = "https://github.com/spider-rs/spider_remote_cache"
