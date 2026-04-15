@@ -1,0 +1,23 @@
+[package]
+name = "spider_remote_cache"
+version = "0.2.0"
+edition = "2021"
+authors = ["j-mendez <jeff@spider.cloud>"]
+repository = "https://github.com/spider-rs/spider_remote_cache"
+description = "Shared remote cache upload worker for spider and chromey"
+license = "MIT"
+keywords = ["cache", "remote", "spider", "chromey"]
+categories = ["caching", "web-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+dashmap = "6"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
