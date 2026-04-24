@@ -20,6 +20,7 @@
 //! - **Best-effort**: `try_enqueue` never blocks; drops on full queue
 
 pub mod client;
+pub mod spool;
 pub mod types;
 pub mod worker;
 
@@ -28,9 +29,11 @@ pub use client::{
     build_payload, dump_batch_to_remote, dump_to_remote, get_client, get_endpoint,
     resolve_base_url, set_client, set_endpoint,
 };
+pub use spool::{spool_bytes, spool_dir, spool_max_bytes};
 pub use types::{HttpVersion, HybridCachePayload};
 pub use worker::{
     default_max_body_size, default_max_concurrent, default_queue_cap, default_queue_memory_budget,
     default_qps, default_timeout_ms, enqueue, enqueue_best_effort, init_default_worker,
-    init_remote_dump_worker, queue_bytes, try_enqueue, worker_inited, DumpJob,
+    init_remote_dump_worker, queue_bytes, set_skip_browser_dumps_enabled, set_spool_enabled,
+    skip_browser_dumps_enabled, spool_enabled, try_enqueue, worker_inited, DumpJob,
 };

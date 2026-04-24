@@ -1,6 +1,6 @@
 [package]
 name = "spider_remote_cache"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["j-mendez <jeff@spider.cloud>"]
 repository = "https://github.com/spider-rs/spider_remote_cache"
@@ -10,14 +10,17 @@ keywords = ["cache", "remote", "spider", "chromey"]
 categories = ["caching", "web-programming"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "rt", "sync", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1"
 base64 = "0.22"
+blake3 = "1"
 dashmap = "6"
 tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] }
+tempfile = "3"

@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, OnceCell};
 use tokio::task::JoinSet;
 
 use crate::client;
+use crate::spool;
 use crate::types::HttpVersion;
 
 static REMOTE_DUMP_TX: OnceCell<mpsc::Sender<DumpJob>> = OnceCell::const_new();
@@ -18,8 +19,68 @@ static REMOTE_DUMP_TX: OnceCell<mpsc::Sender<DumpJob>> = OnceCell::const_new();
 /// Incremented on enqueue, decremented when the worker consumes a job.
 static QUEUE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Runtime toggle: whether the HTTP (skip_browser) dump path is active.
+/// Callers flip this via [`set_skip_browser_dumps_enabled`] — the crawl
+/// machinery reads it with [`skip_browser_dumps_enabled`] before enqueuing.
+/// Wait-free on the hot path.
+static SKIP_BROWSER_DUMPS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Runtime toggle: whether [`try_enqueue`] / [`enqueue_best_effort`] should
+/// spill to the on-disk spool when the in-memory channel is full or the
+/// memory budget is exceeded. Default `false` preserves the pre-spool
+/// drop-on-overflow behavior — existing users see zero regression.
+static SPOOL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable the HTTP (skip_browser) dump path globally.
+///
+/// Wiring from a per-crawl [`Configuration`] sets this on crawl start.
+/// Safe to call from any thread; no allocation, no lock, no panic.
+///
+/// [`Configuration`]: https://docs.rs/spider/latest/spider/configuration/struct.Configuration.html
+#[inline]
+pub fn set_skip_browser_dumps_enabled(enabled: bool) {
+    SKIP_BROWSER_DUMPS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the HTTP (skip_browser) dump path should enqueue jobs.
+/// Wait-free read; safe to call from the hot crawl path.
+#[inline]
+pub fn skip_browser_dumps_enabled() -> bool {
+    SKIP_BROWSER_DUMPS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable or disable the disk-backed overflow spool. Default `false`.
+///
+/// When `false`, `try_enqueue` / `enqueue_best_effort` drop jobs on
+/// channel-full or memory-budget-exceeded exactly like prior releases —
+/// zero behavior change. When `true`, overflow jobs atomically spill to
+/// the spool directory (see [`crate::spool`]) and a background drain
+/// reloads them when the channel has headroom.
+#[inline]
+pub fn set_spool_enabled(enabled: bool) {
+    SPOOL_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the disk-backed overflow spool is active.
+#[inline]
+pub fn spool_enabled() -> bool {
+    SPOOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How often the worker wakes to check the disk spool even if no new jobs
+/// are arriving on the channel. Keeps spool drainage progressing during
+/// idle periods.
+const SPOOL_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum spool entries to pull back into the channel in a single drain.
+/// Chosen small so we never stall the upload loop; the drain repeats on
+/// each outer iteration.
+const SPOOL_DRAIN_BATCH: usize = 32;
+
 /// A job representing a single cached response to upload to the remote cache.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DumpJob {
     pub cache_key: String,
     pub cache_site: String,
@@ -54,6 +115,7 @@ const MAX_BATCH_SIZE: usize = 16;
 
 async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender<DumpJob> {
     let (tx, mut rx) = mpsc::channel::<DumpJob>(queue_cap.max(1));
+    let drain_tx = tx.clone();
     let max_concurrent = default_max_concurrent();
 
     tokio::spawn(async move {
@@ -74,9 +136,56 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
         loop {
             reap_completed(&mut join_set, &inflight);
 
-            let first_job = match rx.recv().await {
-                Some(job) => job,
-                None => break,
+            // Opportunistic spool drain — only active when the spool is
+            // enabled. Preserves the prior recv-blocks-forever behavior
+            // for existing users who haven't opted into the spool.
+            let spool_on = spool_enabled();
+            if spool_on && spool::spool_bytes() > 0 && queue_has_headroom_for_drain() {
+                for _ in 0..SPOOL_DRAIN_BATCH {
+                    match spool::spool_pop_one().await {
+                        Some(job) => {
+                            let est = job.estimated_bytes();
+                            match drain_tx.try_send(job) {
+                                Ok(()) => {
+                                    QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Full(returned)) => {
+                                    // Channel filled before we could finish
+                                    // draining — re-spool this one and try
+                                    // again next loop iteration.
+                                    if let Err(err) = spool::spool_write(&returned).await {
+                                        tracing::warn!(
+                                            "remote dump: re-spool failed after drain refusal: {err}"
+                                        );
+                                    }
+                                    break;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    return;
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            // When the spool is on, use a bounded timeout so an idle
+            // channel still wakes periodically to check for spooled work.
+            // When the spool is off, preserve the original indefinite
+            // blocking recv so we don't change CPU behavior for existing
+            // users.
+            let first_job = if spool_on {
+                match tokio::time::timeout(SPOOL_POLL_INTERVAL, rx.recv()).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            } else {
+                match rx.recv().await {
+                    Some(job) => job,
+                    None => break,
+                }
             };
 
             // Track bytes released from the queue as we drain.
@@ -256,52 +365,114 @@ pub async fn init_remote_dump_worker(
         .clone()
 }
 
-/// Returns `true` if the job is within the configured body size limit.
-/// Oversized jobs are silently dropped to protect memory and CPU.
+/// Returns `true` if the job's body is within the configured size limit.
+/// Oversized bodies are dropped outright — they're too big for the remote
+/// cache server as well, so disk-spooling them would just waste space.
 #[inline]
-fn within_limits(job: &DumpJob) -> bool {
+fn body_within_size(job: &DumpJob) -> bool {
     let max = default_max_body_size();
     if max > 0 && job.body.len() > max {
         tracing::debug!(
-            "remote dump skipped: body {} bytes exceeds max {} for {}",
+            "remote dump dropped: body {} bytes exceeds max {} for {}",
             job.body.len(),
             max,
             job.cache_key,
         );
         return false;
     }
-    let budget = default_queue_memory_budget();
-    if budget > 0 && QUEUE_BYTES.load(Ordering::Relaxed) > budget {
-        tracing::debug!(
-            "remote dump skipped: queue memory budget {}B exceeded",
-            budget,
-        );
-        return false;
-    }
     true
 }
 
-/// Auto-init on first use + best-effort enqueue (never blocks on full queue).
+/// Returns `true` if the in-memory queue has room within its byte budget.
+/// When this returns false we fall back to the disk spool rather than
+/// dropping the job.
+#[inline]
+fn queue_has_memory_headroom() -> bool {
+    let budget = default_queue_memory_budget();
+    budget == 0 || QUEUE_BYTES.load(Ordering::Relaxed) <= budget
+}
+
+/// Returns `true` if the queue is below half its memory budget — the
+/// threshold at which the worker is willing to refill from the spool.
+/// Prevents oscillation between memory and disk.
+#[inline]
+fn queue_has_headroom_for_drain() -> bool {
+    let budget = default_queue_memory_budget();
+    budget == 0 || QUEUE_BYTES.load(Ordering::Relaxed) < budget / 2
+}
+
+/// Fire-and-forget spool write. Returns `true` if the spool task was
+/// scheduled (best-effort — success of the write itself is logged).
+/// Returns `false` if the spool is disabled, no worker exists to drain
+/// it, or we are not running under a tokio runtime — in which case the
+/// caller falls back to the prior drop-on-overflow behavior.
+fn spool_fire_and_forget(job: DumpJob) -> bool {
+    if !spool_enabled() {
+        return false;
+    }
+    if REMOTE_DUMP_TX.get().is_none() {
+        tracing::debug!("remote dump dropped: no worker to drain spool");
+        return false;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        tracing::debug!("remote dump dropped: no tokio runtime for spool write");
+        return false;
+    }
+    tokio::spawn(async move {
+        match spool::spool_write(&job).await {
+            Ok(n) => {
+                tracing::debug!(
+                    "remote dump spooled to disk: {n} bytes for {}",
+                    job.cache_key
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "remote dump: spool failed for {} ({}B body): {err}",
+                    job.cache_key,
+                    job.body.len(),
+                );
+            }
+        }
+    });
+    true
+}
+
+/// Auto-init on first use + best-effort enqueue.
+///
+/// On full channel or over-budget in-memory queue, the job spills to the
+/// on-disk spool instead of being dropped. Still returns `false` only when
+/// the body is oversized or no tokio runtime is available.
 pub async fn enqueue_best_effort(job: DumpJob) -> bool {
-    if !within_limits(&job) {
+    if !body_within_size(&job) {
         return false;
     }
     let tx =
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
+
+    if !queue_has_memory_headroom() {
+        return spool_fire_and_forget(job);
+    }
+
     let est = job.estimated_bytes();
     match tx.try_send(job) {
         Ok(()) => {
             QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
             true
         }
-        Err(_) => false,
+        Err(mpsc::error::TrySendError::Full(returned)) => spool_fire_and_forget(returned),
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
-/// Enqueue with backpressure (blocks if queue is full).
+/// Enqueue with backpressure (awaits channel room).
+///
+/// Does not involve the disk spool — this variant is for callers that
+/// explicitly want to wait rather than spill. Use `enqueue_best_effort`
+/// or `try_enqueue` for the disk-backed fast path.
 pub async fn enqueue(job: DumpJob) -> Result<(), mpsc::error::SendError<DumpJob>> {
-    if !within_limits(&job) {
-        return Ok(()); // silently drop oversized/over-budget jobs
+    if !body_within_size(&job) {
+        return Ok(());
     }
     let tx =
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
@@ -320,20 +491,35 @@ pub fn worker_inited() -> bool {
     REMOTE_DUMP_TX.initialized()
 }
 
-/// Non-async enqueue (fast path). Drops if queue is full or worker not initialized.
+/// Non-async enqueue (fast path).
+///
+/// On full channel or over-budget in-memory queue, the job spills to the
+/// on-disk spool rather than being dropped. Returns `false` only when the
+/// body is oversized, no worker has been initialized, or no tokio runtime
+/// is available.
 pub fn try_enqueue(job: DumpJob) -> bool {
-    if !within_limits(&job) {
+    if !body_within_size(&job) {
         return false;
     }
-    let est = job.estimated_bytes();
-    let ok = REMOTE_DUMP_TX
-        .get()
-        .and_then(|tx| tx.try_send(job).ok())
-        .is_some();
-    if ok {
-        QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+    // Fast path: worker + channel + memory budget.
+    if queue_has_memory_headroom() {
+        if let Some(tx) = REMOTE_DUMP_TX.get() {
+            let est = job.estimated_bytes();
+            match tx.try_send(job) {
+                Ok(()) => {
+                    QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    return spool_fire_and_forget(returned);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        return false; // worker not initialized
     }
-    ok
+    // Over memory budget — spool instead of dropping.
+    spool_fire_and_forget(job)
 }
 
 /// Returns the approximate number of bytes currently queued for upload.
