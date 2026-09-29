@@ -156,7 +156,10 @@ async fn try_take(path: &Path) -> Option<DumpJob> {
         tracing::warn!("spool: remove {:?} failed: {err}", path);
         // We still accept the job — filesystem will retry deletion later.
     }
-    SPOOL_BYTES.fetch_sub(file_len.min(SPOOL_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+    SPOOL_BYTES.fetch_sub(
+        file_len.min(SPOOL_BYTES.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
 
     match bincode::deserialize::<DumpJob>(&bytes) {
         Ok(job) => Some(job),
@@ -168,6 +171,9 @@ async fn try_take(path: &Path) -> Option<DumpJob> {
 }
 
 #[cfg(test)]
+// The std Mutex guard is held across awaits on purpose: it serializes the
+// process-wide env vars these tests set.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
