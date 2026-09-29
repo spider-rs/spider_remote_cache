@@ -20,7 +20,13 @@ blake3 = "1"
 dashmap = "6"
 tracing = "0.1"
 url = "2"
+metrics = { version = "0.24", optional = true }
+
+[features]
+default = ["metrics"]
+# Record counters, a gauge and a histogram through the `metrics` facade.
+metrics = ["dep:metrics"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs", "net", "io-util"] }
 tempfile = "3"
