@@ -15,9 +15,30 @@ use crate::types::HttpVersion;
 
 static REMOTE_DUMP_TX: OnceCell<mpsc::Sender<DumpJob>> = OnceCell::const_new();
 
-/// Approximate number of bytes currently sitting in the queue + batch drain.
-/// Incremented on enqueue, decremented when the worker consumes a job.
+/// Approximate bytes held by jobs the worker has accepted and not yet
+/// finished: queued in the channel, drained into a batch, or in an upload
+/// that has not returned. Incremented on enqueue, decremented when the
+/// upload for the job ends (success, failure or timeout) or the job is
+/// discarded as a duplicate.
 static QUEUE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn add_queue_bytes(n: usize) {
+    let now = QUEUE_BYTES
+        .fetch_add(n, Ordering::Relaxed)
+        .saturating_add(n);
+    crate::metrics::queue_bytes(now);
+}
+
+#[inline]
+fn release_queue_bytes(n: usize) {
+    let prev = QUEUE_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(n))
+        })
+        .unwrap_or(0);
+    crate::metrics::queue_bytes(prev.saturating_sub(n));
+}
 
 /// Runtime toggle: whether the HTTP (skip_browser) dump path is active.
 /// Callers flip this via [`set_skip_browser_dumps_enabled`] — the crawl
@@ -30,8 +51,7 @@ static SKIP_BROWSER_DUMPS_ENABLED: std::sync::atomic::AtomicBool =
 /// spill to the on-disk spool when the in-memory channel is full or the
 /// memory budget is exceeded. Default `false` preserves the pre-spool
 /// drop-on-overflow behavior — existing users see zero regression.
-static SPOOL_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SPOOL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enable or disable the HTTP (skip_browser) dump path globally.
 ///
@@ -145,15 +165,20 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
                     match spool::spool_pop_one().await {
                         Some(job) => {
                             let est = job.estimated_bytes();
+                            // Count the bytes before the send so the worker
+                            // can never release them first.
+                            add_queue_bytes(est);
                             match drain_tx.try_send(job) {
-                                Ok(()) => {
-                                    QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
-                                }
+                                Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(returned)) => {
+                                    release_queue_bytes(est);
                                     // Channel filled before we could finish
                                     // draining — re-spool this one and try
                                     // again next loop iteration.
                                     if let Err(err) = spool::spool_write(&returned).await {
+                                        crate::metrics::dropped(
+                                            crate::metrics::reason::SPOOL_ERROR,
+                                        );
                                         tracing::warn!(
                                             "remote dump: re-spool failed after drain refusal: {err}"
                                         );
@@ -161,6 +186,7 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
                                     break;
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    release_queue_bytes(est);
                                     return;
                                 }
                             }
@@ -188,40 +214,41 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
                 }
             };
 
-            // Track bytes released from the queue as we drain.
-            let mut drained_bytes = first_job.estimated_bytes();
-
             // Batch-drain pending jobs, but cap the drain to avoid
             // building an enormous Vec when the channel is backed up.
+            // Drained jobs stay counted in QUEUE_BYTES until their upload
+            // ends, so the memory budget covers them too.
             let mut batch = Vec::with_capacity(max_drain.min(64));
             batch.push(first_job);
             while batch.len() < max_drain {
                 match rx.try_recv() {
-                    Ok(job) => {
-                        drained_bytes += job.estimated_bytes();
-                        batch.push(job);
-                    }
+                    Ok(job) => batch.push(job),
                     Err(_) => break,
                 }
             }
 
-            // Release the tracked queue bytes now that we own the jobs.
-            QUEUE_BYTES.fetch_sub(drained_bytes, Ordering::Relaxed);
-
-            // Dedup against in-flight keys and group by endpoint.
-            let mut groups: HashMap<String, Vec<DumpJob>> = HashMap::new();
+            // Dedup against in-flight keys and group by (endpoint, site).
+            // The server files a whole batch under one `x-cache-site`, so
+            // only jobs with the same cache_site may share a request.
+            let mut groups: HashMap<(String, String), Vec<DumpJob>> = HashMap::new();
             for job in batch {
                 if !inflight.insert(job.cache_key.clone()) {
+                    release_queue_bytes(job.estimated_bytes());
+                    crate::metrics::dropped(crate::metrics::reason::INFLIGHT_DUP);
                     continue;
                 }
-                let base_url =
-                    client::resolve_base_url(job.dump_remote.as_deref()).to_string();
-                groups.entry(base_url).or_default().push(job);
+                let base_url = client::resolve_base_url(job.dump_remote.as_deref()).to_string();
+                groups
+                    .entry((base_url, job.cache_site.clone()))
+                    .or_default()
+                    .push(job);
             }
 
-            // Spawn upload tasks per endpoint group, chunked into batches.
-            for (base_url, jobs) in groups {
-                for chunk in chunks_into_vec(jobs, MAX_BATCH_SIZE) {
+            // Spawn upload tasks per group, chunked into batches.
+            let mut groups = groups.into_iter();
+            'groups: while let Some(((base_url, cache_site), jobs)) = groups.next() {
+                let mut chunks = chunks_into_vec(jobs, MAX_BATCH_SIZE).into_iter();
+                while let Some(chunk) = chunks.next() {
                     let elapsed = last_spawn.elapsed();
                     if elapsed < spawn_interval {
                         tokio::time::sleep(spawn_interval - elapsed).await;
@@ -230,30 +257,51 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
 
                     let permit = match sem.clone().acquire_owned().await {
                         Ok(p) => p,
-                        Err(_) => break,
+                        Err(_) => {
+                            // Semaphore closed: nothing more will upload.
+                            // Release everything still held.
+                            let rest = std::iter::once(chunk)
+                                .chain(chunks)
+                                .flatten()
+                                .chain(groups.flat_map(|(_, jobs)| jobs));
+                            for job in rest {
+                                inflight.remove(&job.cache_key);
+                                release_queue_bytes(job.estimated_bytes());
+                            }
+                            break 'groups;
+                        }
                     };
 
                     let inflight_ref = inflight.clone();
                     let base_url = base_url.clone();
-                    let keys: Vec<String> =
-                        chunk.iter().map(|j| j.cache_key.clone()).collect();
+                    let cache_site = cache_site.clone();
+                    let keys: Vec<String> = chunk.iter().map(|j| j.cache_key.clone()).collect();
+                    let chunk_bytes: usize = chunk.iter().map(DumpJob::estimated_bytes).sum();
 
                     join_set.spawn(async move {
                         let _permit = permit;
+                        let started = std::time::Instant::now();
 
                         let result = tokio::time::timeout(
                             timeout,
-                            upload_chunk(chunk, &base_url),
+                            upload_chunk(chunk, &cache_site, &base_url),
                         )
                         .await;
 
                         if result.is_err() {
+                            crate::metrics::upload(
+                                crate::metrics::outcome::TIMEOUT,
+                                started.elapsed().as_secs_f64() * 1000.0,
+                            );
                             tracing::warn!(
                                 "remote cache dump: batch of {} timed out after {}ms",
                                 keys.len(),
                                 timeout.as_millis(),
                             );
                         }
+
+                        // The chunk (and its bodies) is gone now.
+                        release_queue_bytes(chunk_bytes);
 
                         for key in &keys {
                             inflight_ref.remove(key);
@@ -281,10 +329,7 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
     tx
 }
 
-fn reap_completed(
-    join_set: &mut JoinSet<Vec<String>>,
-    inflight: &Arc<dashmap::DashSet<String>>,
-) {
+fn reap_completed(join_set: &mut JoinSet<Vec<String>>, inflight: &Arc<dashmap::DashSet<String>>) {
     while let Some(result) = join_set.try_join_next() {
         if let Ok(keys) = result {
             for key in keys {
@@ -294,7 +339,7 @@ fn reap_completed(
     }
 }
 
-async fn upload_chunk(jobs: Vec<DumpJob>, base_url: &str) {
+async fn upload_chunk(jobs: Vec<DumpJob>, cache_site: &str, base_url: &str) {
     if jobs.len() == 1 {
         let job = jobs.into_iter().next().unwrap();
         client::dump_to_remote(
@@ -326,7 +371,7 @@ async fn upload_chunk(jobs: Vec<DumpJob>, base_url: &str) {
                 )
             })
             .collect();
-        client::dump_batch_to_remote(payloads, base_url).await;
+        client::dump_site_batch_to_remote(payloads, cache_site, base_url).await;
     }
 }
 
@@ -372,6 +417,7 @@ pub async fn init_remote_dump_worker(
 fn body_within_size(job: &DumpJob) -> bool {
     let max = default_max_body_size();
     if max > 0 && job.body.len() > max {
+        crate::metrics::dropped(crate::metrics::reason::OVERSIZE);
         tracing::debug!(
             "remote dump dropped: body {} bytes exceeds max {} for {}",
             job.body.len(),
@@ -401,24 +447,61 @@ fn queue_has_headroom_for_drain() -> bool {
     budget == 0 || QUEUE_BYTES.load(Ordering::Relaxed) < budget / 2
 }
 
+/// Bounds concurrent spool writes. Each pending write holds its job (body
+/// included) in memory, so without this a burst of overflow would pin an
+/// unbounded number of bodies while the disk catches up.
+static SPOOL_WRITERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+
+fn spool_writers() -> &'static Arc<tokio::sync::Semaphore> {
+    SPOOL_WRITERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(default_spool_writers())))
+}
+
+/// Maximum concurrent spool writes. Overflow beyond this is dropped
+/// (counted as `spool_busy`).
+///
+/// Override via env `HYBRID_CACHE_REMOTE_SPOOL_WRITERS`. Default 16.
+pub fn default_spool_writers() -> usize {
+    std::env::var("HYBRID_CACHE_REMOTE_SPOOL_WRITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
+        .max(1)
+}
+
 /// Fire-and-forget spool write. Returns `true` if the spool task was
 /// scheduled (best-effort — success of the write itself is logged).
 /// Returns `false` if the spool is disabled, no worker exists to drain
-/// it, or we are not running under a tokio runtime — in which case the
-/// caller falls back to the prior drop-on-overflow behavior.
-fn spool_fire_and_forget(job: DumpJob) -> bool {
+/// it, every spool writer slot is busy, or we are not running under a
+/// tokio runtime — in which case the job is dropped as before the spool
+/// existed. `overflow_reason` labels the drop when the spool is off.
+fn spool_fire_and_forget(job: DumpJob, overflow_reason: &'static str) -> bool {
     if !spool_enabled() {
+        crate::metrics::dropped(overflow_reason);
         return false;
     }
     if REMOTE_DUMP_TX.get().is_none() {
+        crate::metrics::dropped(crate::metrics::reason::NO_WORKER);
         tracing::debug!("remote dump dropped: no worker to drain spool");
         return false;
     }
     if tokio::runtime::Handle::try_current().is_err() {
+        crate::metrics::dropped(crate::metrics::reason::NO_RUNTIME);
         tracing::debug!("remote dump dropped: no tokio runtime for spool write");
         return false;
     }
+    let permit = match spool_writers().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            crate::metrics::dropped(crate::metrics::reason::SPOOL_BUSY);
+            tracing::debug!(
+                "remote dump dropped: all spool writers busy for {}",
+                job.cache_key
+            );
+            return false;
+        }
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         match spool::spool_write(&job).await {
             Ok(n) => {
                 tracing::debug!(
@@ -427,6 +510,7 @@ fn spool_fire_and_forget(job: DumpJob) -> bool {
                 );
             }
             Err(err) => {
+                crate::metrics::dropped(crate::metrics::reason::SPOOL_ERROR);
                 tracing::warn!(
                     "remote dump: spool failed for {} ({}B body): {err}",
                     job.cache_key,
@@ -451,17 +535,22 @@ pub async fn enqueue_best_effort(job: DumpJob) -> bool {
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
 
     if !queue_has_memory_headroom() {
-        return spool_fire_and_forget(job);
+        return spool_fire_and_forget(job, crate::metrics::reason::MEMORY_BUDGET);
     }
 
     let est = job.estimated_bytes();
+    add_queue_bytes(est);
     match tx.try_send(job) {
-        Ok(()) => {
-            QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
-            true
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(returned)) => {
+            release_queue_bytes(est);
+            spool_fire_and_forget(returned, crate::metrics::reason::QUEUE_FULL)
         }
-        Err(mpsc::error::TrySendError::Full(returned)) => spool_fire_and_forget(returned),
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            release_queue_bytes(est);
+            crate::metrics::dropped(crate::metrics::reason::CLOSED);
+            false
+        }
     }
 }
 
@@ -477,12 +566,14 @@ pub async fn enqueue(job: DumpJob) -> Result<(), mpsc::error::SendError<DumpJob>
     let tx =
         init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
     let est = job.estimated_bytes();
+    add_queue_bytes(est);
     match tx.send(job).await {
-        Ok(()) => {
-            QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
-            Ok(())
+        Ok(()) => Ok(()),
+        Err(e) => {
+            release_queue_bytes(est);
+            crate::metrics::dropped(crate::metrics::reason::CLOSED);
+            Err(e)
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -505,21 +596,25 @@ pub fn try_enqueue(job: DumpJob) -> bool {
     if queue_has_memory_headroom() {
         if let Some(tx) = REMOTE_DUMP_TX.get() {
             let est = job.estimated_bytes();
+            add_queue_bytes(est);
             match tx.try_send(job) {
-                Ok(()) => {
-                    QUEUE_BYTES.fetch_add(est, Ordering::Relaxed);
-                    return true;
-                }
+                Ok(()) => return true,
                 Err(mpsc::error::TrySendError::Full(returned)) => {
-                    return spool_fire_and_forget(returned);
+                    release_queue_bytes(est);
+                    return spool_fire_and_forget(returned, crate::metrics::reason::QUEUE_FULL);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    release_queue_bytes(est);
+                    crate::metrics::dropped(crate::metrics::reason::CLOSED);
+                    return false;
+                }
             }
         }
+        crate::metrics::dropped(crate::metrics::reason::NO_WORKER);
         return false; // worker not initialized
     }
     // Over memory budget — spool instead of dropping.
-    spool_fire_and_forget(job)
+    spool_fire_and_forget(job, crate::metrics::reason::MEMORY_BUDGET)
 }
 
 /// Returns the approximate number of bytes currently queued for upload.

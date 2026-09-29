@@ -1,6 +1,6 @@
 [package]
 name = "spider_remote_cache"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["j-mendez <jeff@spider.cloud>"]
 repository = "https://github.com/spider-rs/spider_remote_cache"
@@ -20,7 +20,13 @@ blake3 = "1"
 dashmap = "6"
 tracing = "0.1"
 url = "2"
+metrics = { version = "0.24", optional = true }
+
+[features]
+default = ["metrics"]
+# Record counters, a gauge and a histogram through the `metrics` facade.
+metrics = ["dep:metrics"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs", "net", "io-util"] }
 tempfile = "3"
