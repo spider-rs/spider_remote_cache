@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -7,7 +8,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, OnceCell};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client;
 use crate::spool;
@@ -133,13 +134,46 @@ impl DumpJob {
 /// Maximum number of items to send in a single batch POST.
 const MAX_BATCH_SIZE: usize = 16;
 
-async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender<DumpJob> {
-    let (tx, mut rx) = mpsc::channel::<DumpJob>(queue_cap.max(1));
-    let drain_tx = tx.clone();
-    let max_concurrent = default_max_concurrent();
+/// Queue admission has its own deadline; upload deadlines still start
+/// after a concurrency permit is acquired.
+const QUEUE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(2_500);
 
-    tokio::spawn(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender<DumpJob> {
+    let (tx, _worker) = spawn_worker(
+        queue_cap,
+        qps,
+        timeout_ms,
+        default_max_concurrent(),
+        |chunk, cache_site, base_url| async move {
+            upload_chunk(chunk, &cache_site, &base_url).await;
+        },
+    );
+    tx
+}
+
+// Keep construction and scheduling shared with offline tests, which supply
+// an uploader without HTTP or process-global client/worker initialization.
+fn spawn_worker<U, F>(
+    queue_cap: usize,
+    qps: u32,
+    timeout_ms: u64,
+    max_concurrent: usize,
+    upload: U,
+) -> (mpsc::Sender<DumpJob>, JoinHandle<()>)
+where
+    U: Fn(Vec<DumpJob>, String, String) -> F + Clone + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    // Validate every capacity and construct the semaphore before spawning
+    // or publishing the sender through REMOTE_DUMP_TX. Invalid configuration
+    // must never leave that OnceCell pointing at a dead or parked worker.
+    let queue_cap = QUEUE_CAPACITY.clamp(queue_cap);
+    let max_concurrent = UPLOAD_CONCURRENCY.clamp(max_concurrent);
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let (tx, mut rx) = mpsc::channel::<DumpJob>(queue_cap);
+    let drain_tx = tx.clone();
+
+    let worker = tokio::spawn(async move {
         let inflight: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
         let mut join_set = JoinSet::<Vec<String>>::new();
 
@@ -277,16 +311,14 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
                     let cache_site = cache_site.clone();
                     let keys: Vec<String> = chunk.iter().map(|j| j.cache_key.clone()).collect();
                     let chunk_bytes: usize = chunk.iter().map(DumpJob::estimated_bytes).sum();
+                    let upload = upload.clone();
 
                     join_set.spawn(async move {
                         let _permit = permit;
                         let started = std::time::Instant::now();
 
-                        let result = tokio::time::timeout(
-                            timeout,
-                            upload_chunk(chunk, &cache_site, &base_url),
-                        )
-                        .await;
+                        let result =
+                            tokio::time::timeout(timeout, upload(chunk, cache_site, base_url)).await;
 
                         if result.is_err() {
                             crate::metrics::upload(
@@ -326,7 +358,7 @@ async fn init_inner(queue_cap: usize, qps: u32, timeout_ms: u64) -> mpsc::Sender
         }
     });
 
-    tx
+    (tx, worker)
 }
 
 fn reap_completed(join_set: &mut JoinSet<Vec<String>>, inflight: &Arc<dashmap::DashSet<String>>) {
@@ -399,6 +431,10 @@ fn chunks_into_vec<T>(vec: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
 // ---------------------------------------------------------------------------
 
 /// Manual init (optional). Safe to call multiple times.
+///
+/// `queue_cap` is clamped to 1..=65,536, with a warning when changed.
+/// Queue and upload capacities are validated before the sender is published;
+/// the first initialization's settings apply for the lifetime of the worker.
 pub async fn init_remote_dump_worker(
     queue_cap: usize,
     qps: u32,
@@ -408,6 +444,14 @@ pub async fn init_remote_dump_worker(
         .get_or_init(|| init_inner(queue_cap, qps, timeout_ms))
         .await
         .clone()
+}
+
+async fn default_worker_sender() -> &'static mpsc::Sender<DumpJob> {
+    REMOTE_DUMP_TX
+        // Read and warn about default configuration only during initialization,
+        // rather than logging the same invalid environment on every enqueue.
+        .get_or_init(|| init_inner(default_queue_cap(), default_qps(), default_timeout_ms()))
+        .await
 }
 
 /// Returns `true` if the job's body is within the configured size limit.
@@ -460,12 +504,9 @@ fn spool_writers() -> &'static Arc<tokio::sync::Semaphore> {
 /// (counted as `spool_busy`).
 ///
 /// Override via env `HYBRID_CACHE_REMOTE_SPOOL_WRITERS`. Default 16.
+/// Clamped to 1..=64, with a warning for invalid values.
 pub fn default_spool_writers() -> usize {
-    std::env::var("HYBRID_CACHE_REMOTE_SPOOL_WRITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
-        .max(1)
+    SPOOL_WRITER_CAPACITY.read_env()
 }
 
 /// Fire-and-forget spool write. Returns `true` if the spool task was
@@ -531,8 +572,7 @@ pub async fn enqueue_best_effort(job: DumpJob) -> bool {
     if !body_within_size(&job) {
         return false;
     }
-    let tx =
-        init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
+    let tx = default_worker_sender().await;
 
     if !queue_has_memory_headroom() {
         return spool_fire_and_forget(job, crate::metrics::reason::MEMORY_BUDGET);
@@ -554,27 +594,49 @@ pub async fn enqueue_best_effort(job: DumpJob) -> bool {
     }
 }
 
-/// Enqueue with backpressure (awaits channel room).
+/// Enqueue with backpressure (waits up to 2,500 ms for channel room).
 ///
 /// Does not involve the disk spool — this variant is for callers that
 /// explicitly want to wait rather than spill. Use `enqueue_best_effort`
 /// or `try_enqueue` for the disk-backed fast path.
+/// Returns the original job in `SendError` if the receiver closes or the
+/// admission deadline expires. Cancelling the wait does not retain queue
+/// capacity or count the unaccepted job toward the queue's byte budget.
 pub async fn enqueue(job: DumpJob) -> Result<(), mpsc::error::SendError<DumpJob>> {
     if !body_within_size(&job) {
         return Ok(());
     }
-    let tx =
-        init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
-    let est = job.estimated_bytes();
-    add_queue_bytes(est);
-    match tx.send(job).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            release_queue_bytes(est);
+    let tx = default_worker_sender().await;
+    enqueue_with_timeout(tx, job, QUEUE_ADMISSION_TIMEOUT).await
+}
+
+async fn enqueue_with_timeout(
+    tx: &mpsc::Sender<DumpJob>,
+    job: DumpJob,
+    timeout: Duration,
+) -> Result<(), mpsc::error::SendError<DumpJob>> {
+    // Reserve without transferring the job: timeout can return it through
+    // the existing error type, and cancellation cannot leak byte accounting.
+    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
             crate::metrics::dropped(crate::metrics::reason::CLOSED);
-            Err(e)
+            return Err(mpsc::error::SendError(job));
         }
-    }
+        Err(_) => {
+            crate::metrics::dropped(crate::metrics::reason::QUEUE_TIMEOUT);
+            tracing::warn!(
+                "remote dump: queue admission timed out after {}ms",
+                timeout.as_millis(),
+            );
+            return Err(mpsc::error::SendError(job));
+        }
+    };
+    // No await between counting and sending: neither cancellation nor the
+    // receiving worker can race ahead of the accounting increment.
+    add_queue_bytes(job.estimated_bytes());
+    permit.send(job);
+    Ok(())
 }
 
 /// Returns true if the worker has been initialized.
@@ -624,18 +686,92 @@ pub fn queue_bytes() -> usize {
 
 /// Init the worker with default settings.
 pub async fn init_default_worker() {
-    init_remote_dump_worker(default_queue_cap(), default_qps(), default_timeout_ms()).await;
+    default_worker_sender().await;
 }
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
+// Practical bounds protect memory/task counts as well as Tokio's much larger
+// hard semaphore limit. Public APIs return plain values, so invalid settings
+// are clamped (or fall back on parse failure) with a visible warning.
+#[derive(Clone, Copy)]
+struct CapacitySetting {
+    name: &'static str,
+    default: usize,
+    max: usize,
+}
+
+const QUEUE_CAPACITY: CapacitySetting = CapacitySetting {
+    name: "HYBRID_CACHE_REMOTE_QUEUE_CAP",
+    default: 2_000,
+    max: 65_536,
+};
+const UPLOAD_CONCURRENCY: CapacitySetting = CapacitySetting {
+    name: "HYBRID_CACHE_REMOTE_MAX_CONCURRENT",
+    default: 8,
+    max: 256,
+};
+const SPOOL_WRITER_CAPACITY: CapacitySetting = CapacitySetting {
+    name: "HYBRID_CACHE_REMOTE_SPOOL_WRITERS",
+    default: 16,
+    max: 64,
+};
+
+impl CapacitySetting {
+    fn clamp(self, value: usize) -> usize {
+        let max = self.max.min(tokio::sync::Semaphore::MAX_PERMITS);
+        let clamped = value.clamp(1, max);
+        if clamped != value {
+            tracing::warn!(
+                setting = self.name,
+                requested = value,
+                effective = clamped,
+                "remote dump: capacity outside supported range 1..={max}; clamping",
+            );
+        }
+        clamped
+    }
+
+    fn parse(self, value: Option<&str>) -> usize {
+        let value = match value {
+            Some(value) => match value.parse::<usize>() {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        setting = self.name,
+                        effective = self.default,
+                        "remote dump: invalid capacity; using default",
+                    );
+                    self.default
+                }
+            },
+            None => self.default,
+        };
+        self.clamp(value)
+    }
+
+    fn read_env(self) -> usize {
+        match std::env::var(self.name) {
+            Ok(value) => self.parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => self.parse(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    setting = self.name,
+                    effective = self.default,
+                    "remote dump: capacity is not Unicode; using default",
+                );
+                self.parse(None)
+            }
+        }
+    }
+}
+
+/// Queue capacity from `HYBRID_CACHE_REMOTE_QUEUE_CAP`. Default 2,000.
+/// Clamped to 1..=65,536, with a warning for invalid values.
 pub fn default_queue_cap() -> usize {
-    std::env::var("HYBRID_CACHE_REMOTE_QUEUE_CAP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2_000)
+    QUEUE_CAPACITY.read_env()
 }
 
 pub fn default_qps() -> u32 {
@@ -652,11 +788,10 @@ pub fn default_timeout_ms() -> u64 {
         .unwrap_or(2_500)
 }
 
+/// Upload concurrency from `HYBRID_CACHE_REMOTE_MAX_CONCURRENT`. Default 8.
+/// Clamped to 1..=256, with a warning for invalid values.
 pub fn default_max_concurrent() -> usize {
-    std::env::var("HYBRID_CACHE_REMOTE_MAX_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
+    UPLOAD_CONCURRENCY.read_env()
 }
 
 /// Maximum body size (in bytes) for a single dump job.
@@ -679,4 +814,362 @@ pub fn default_queue_memory_budget() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAPACITIES: [CapacitySetting; 3] =
+        [QUEUE_CAPACITY, UPLOAD_CONCURRENCY, SPOOL_WRITER_CAPACITY];
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn job(key: &str) -> DumpJob {
+        DumpJob {
+            cache_key: key.into(),
+            cache_site: "offline-site".into(),
+            url: "https://offline.invalid/page".into(),
+            method: "GET".into(),
+            status: 200,
+            request_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+            body: b"offline body".to_vec(),
+            http_version: HttpVersion::Http11,
+            // Avoid even initializing the global endpoint in these tests.
+            dump_remote: Some("http://offline.invalid".into()),
+        }
+    }
+
+    #[test]
+    fn capacity_defaults_are_preserved() {
+        for (setting, expected) in CAPACITIES.into_iter().zip([2_000, 8, 16]) {
+            assert_eq!(setting.parse(None), expected, "{}", setting.name);
+        }
+        assert_eq!(QUEUE_ADMISSION_TIMEOUT, Duration::from_millis(2_500));
+    }
+
+    #[test]
+    fn valid_capacities_are_preserved() {
+        for setting in CAPACITIES {
+            for value in [1, setting.default, setting.max] {
+                assert_eq!(setting.clamp(value), value, "{}", setting.name);
+                assert_eq!(setting.parse(Some(&value.to_string())), value);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_capacities_are_nonzero_before_construction() {
+        for setting in CAPACITIES {
+            assert_eq!(setting.clamp(0), 1, "{}", setting.name);
+            let capacity = setting.parse(Some("0"));
+            assert_eq!(capacity, 1);
+            assert_eq!(tokio::sync::Semaphore::new(capacity).available_permits(), 1);
+        }
+        let (tx, _rx) = mpsc::channel::<DumpJob>(QUEUE_CAPACITY.clamp(0));
+        assert_eq!(tx.max_capacity(), 1);
+    }
+
+    #[test]
+    fn oversized_capacities_are_bounded_before_construction() {
+        for setting in CAPACITIES {
+            for value in [
+                setting.max + 1,
+                tokio::sync::Semaphore::MAX_PERMITS + 1,
+                usize::MAX,
+            ] {
+                assert_eq!(setting.clamp(value), setting.max, "{}", setting.name);
+                let capacity = setting.parse(Some(&value.to_string()));
+                assert_eq!(capacity, setting.max);
+                assert_eq!(
+                    tokio::sync::Semaphore::new(capacity).available_permits(),
+                    setting.max,
+                );
+            }
+        }
+        let (tx, _rx) = mpsc::channel::<DumpJob>(QUEUE_CAPACITY.clamp(usize::MAX));
+        assert_eq!(tx.max_capacity(), 65_536);
+    }
+
+    #[test]
+    fn malformed_capacity_values_use_valid_defaults() {
+        for setting in CAPACITIES {
+            // Include a number too large to parse even as a 64-bit usize.
+            for value in ["", "invalid", "-1", "18446744073709551616"] {
+                assert_eq!(setting.parse(Some(value)), setting.default);
+            }
+        }
+    }
+
+    #[test]
+    fn spool_writer_limits_keep_overflow_nonblocking() {
+        for value in [0, 16, usize::MAX] {
+            let capacity = SPOOL_WRITER_CAPACITY.parse(Some(&value.to_string()));
+            let sem = Arc::new(tokio::sync::Semaphore::new(capacity));
+            let permits = sem.clone().try_acquire_many_owned(capacity as u32).unwrap();
+            assert!(matches!(
+                sem.clone().try_acquire_owned(),
+                Err(tokio::sync::TryAcquireError::NoPermits),
+            ));
+            drop(permits);
+            assert!(sem.try_acquire_owned().is_ok());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_receiver_returns_the_original_job_immediately() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let started = tokio::time::Instant::now();
+        let err = enqueue_with_timeout(&tx, job("closed"), TEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.cache_key, "closed");
+        assert_eq!(err.0.body, b"offline body");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_closure_wakes_pending_admission() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let mut pending = Box::pin(enqueue_with_timeout(&tx, job("waiting"), TEST_TIMEOUT));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(rx);
+        let started = tokio::time::Instant::now();
+        let err = pending.await.unwrap_err();
+        assert_eq!(err.0.cache_key, "waiting");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_receiver_rejects_pending_admission_without_discarding_queued_jobs() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let mut pending = Box::pin(enqueue_with_timeout(&tx, job("waiting"), TEST_TIMEOUT));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+
+        // close() must wake the reservation even while the receiver and its
+        // previously accepted job stay alive for a graceful drain.
+        rx.close();
+        let started = tokio::time::Instant::now();
+        let err = pending.await.unwrap_err();
+        assert_eq!(err.0.cache_key, "waiting");
+        assert_eq!(err.0.body, b"offline body");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(tx.is_closed());
+        assert_eq!(rx.try_recv().unwrap().cache_key, "occupant");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_times_out_without_losing_the_job_or_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(
+            QUEUE_ADMISSION_TIMEOUT + TEST_TIMEOUT,
+            enqueue_with_timeout(&tx, job("timed-out"), QUEUE_ADMISSION_TIMEOUT),
+        )
+        .await
+        .expect("queue admission must have a deadline")
+        .unwrap_err();
+        assert!(started.elapsed() >= QUEUE_ADMISSION_TIMEOUT);
+        assert!(started.elapsed() < QUEUE_ADMISSION_TIMEOUT + TEST_TIMEOUT);
+        assert_eq!(err.0.cache_key, "timed-out");
+        assert_eq!(err.0.body, b"offline body");
+        assert_eq!(rx.try_recv().unwrap().cache_key, "occupant");
+        assert_eq!(tx.capacity(), 1);
+        // The timed-out reservation must not steal the newly available slot.
+        tx.try_send(err.0).unwrap();
+        assert_eq!(rx.try_recv().unwrap().cache_key, "timed-out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_admission_releases_its_waiter() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let mut pending = Box::pin(enqueue_with_timeout(&tx, job("cancelled"), TEST_TIMEOUT));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(pending);
+        assert_eq!(rx.try_recv().unwrap().cache_key, "occupant");
+        assert_eq!(tx.capacity(), 1);
+        tx.try_send(job("replacement")).unwrap();
+        assert_eq!(rx.try_recv().unwrap().cache_key, "replacement");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_woken_admission_returns_its_assigned_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let mut pending = Box::pin(enqueue_with_timeout(&tx, job("cancelled"), TEST_TIMEOUT));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+
+        assert_eq!(rx.try_recv().unwrap().cache_key, "occupant");
+        // Tokio has assigned the slot to the waiting reservation, but the
+        // admission future has not been polled again to accept its job.
+        assert_eq!(tx.capacity(), 0);
+        drop(pending);
+        assert_eq!(tx.capacity(), 1);
+
+        enqueue_with_timeout(&tx, job("replacement"), TEST_TIMEOUT)
+            .await
+            .unwrap();
+        let accepted = rx.try_recv().unwrap();
+        assert_eq!(accepted.cache_key, "replacement");
+        release_queue_bytes(accepted.estimated_bytes());
+        assert_eq!(tx.capacity(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_succeeds_when_capacity_becomes_available() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(job("occupant")).unwrap();
+        let mut pending = Box::pin(enqueue_with_timeout(&tx, job("accepted"), TEST_TIMEOUT));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert_eq!(rx.try_recv().unwrap().cache_key, "occupant");
+        pending.await.unwrap();
+        let accepted = rx.try_recv().unwrap();
+        assert_eq!(accepted.cache_key, "accepted");
+        // Release only this accepted job's bytes, without resetting globals.
+        release_queue_bytes(accepted.estimated_bytes());
+        assert_eq!(tx.capacity(), 1);
+    }
+
+    async fn assert_worker_schedules(queue_cap: usize, concurrency: usize) {
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let (tx, worker) = spawn_worker(
+            queue_cap,
+            u32::MAX,
+            2_500,
+            concurrency,
+            move |jobs, site, base| {
+                let seen_tx = seen_tx.clone();
+                async move { seen_tx.send((jobs, site, base)).unwrap() }
+            },
+        );
+        assert_eq!(tx.max_capacity(), QUEUE_CAPACITY.clamp(queue_cap));
+        for key in ["first", "second", "third"] {
+            enqueue_with_timeout(&tx, job(key), TEST_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        let mut keys = Vec::new();
+        while keys.len() < 3 {
+            let (jobs, site, base) = tokio::time::timeout(TEST_TIMEOUT, seen_rx.recv())
+                .await
+                .expect("worker must schedule uploads")
+                .unwrap();
+            assert_eq!(site, "offline-site");
+            assert_eq!(base, "http://offline.invalid");
+            keys.extend(jobs.into_iter().map(|job| job.cache_key));
+        }
+        keys.sort();
+        assert_eq!(keys, ["first", "second", "third"]);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_queue_and_concurrency_still_schedule_uploads() {
+        assert_worker_schedules(0, 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_queue_and_concurrency_still_schedule_uploads() {
+        assert_worker_schedules(usize::MAX, usize::MAX).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_capacities_schedule_uploads() {
+        assert_worker_schedules(QUEUE_CAPACITY.parse(None), UPLOAD_CONCURRENCY.parse(None)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_deadline_releases_the_only_permit_for_the_next_job() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_upload = cancelled.clone();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let (tx, worker) = spawn_worker(1, u32::MAX, 25, 1, move |jobs, _, _| {
+            let seen_tx = seen_tx.clone();
+            let cancelled = cancelled_upload.clone();
+            async move {
+                let key = jobs[0].cache_key.clone();
+                seen_tx.send(key.clone()).unwrap();
+                if key == "slow" {
+                    let _signal = DropSignal(cancelled);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        enqueue_with_timeout(&tx, job("slow"), TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, seen_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "slow",
+        );
+        let started = tokio::time::Instant::now();
+        enqueue_with_timeout(&tx, job("next"), TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, seen_rx.recv())
+                .await
+                .expect("timed-out upload must release its permit")
+                .unwrap(),
+            "next",
+        );
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        assert!(started.elapsed() < TEST_TIMEOUT);
+        assert!(cancelled.load(Ordering::Relaxed));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
 }

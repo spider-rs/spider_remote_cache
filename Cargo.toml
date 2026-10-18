@@ -28,5 +28,5 @@ default = ["metrics"]
 metrics = ["dep:metrics"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs", "net", "io-util", "test-util"] }
 tempfile = "3"

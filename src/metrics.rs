@@ -39,6 +39,8 @@ pub mod reason {
     pub const OVERSIZE: &str = "oversize";
     /// Channel full and the spool is off.
     pub const QUEUE_FULL: &str = "queue_full";
+    /// Backpressure admission did not find channel room before its deadline.
+    pub const QUEUE_TIMEOUT: &str = "queue_timeout";
     /// Memory budget exceeded and the spool is off.
     pub const MEMORY_BUDGET: &str = "memory_budget";
     /// Worker channel closed.
